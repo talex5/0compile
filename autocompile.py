@@ -1,157 +1,58 @@
 # Copyright (C) 2009, Thomas Leonard
 # See http://0install.net/0compile.html
 
-import sys, os, __main__, tempfile, subprocess, signal, shutil
+import sys, os, __main__, tempfile, subprocess, signal, shutil, StringIO
 from xml.dom import minidom
 from optparse import OptionParser
-from logging import warn
 
 from zeroinstall import SafeException
-from zeroinstall.injector import arch, handler, driver, requirements, model, iface_cache, namespaces, writer, reader, qdom
+from zeroinstall.injector import arch, model, namespaces, writer, reader, qdom, selections
 from zeroinstall.injector.config import load_config
-from zeroinstall.zerostore import manifest, NotStored
-from zeroinstall.support import tasks, basedir, ro_rmtree
+from zeroinstall.support import tasks, basedir, ro_rmtree, escaping
 
-from support import BuildEnv, canonicalize_machine, XMLNS_0COMPILE
+from support import BuildEnv, canonicalize_machine
 import support
+import solver
 
 build_target_machine_type = canonicalize_machine(support.uname[4])
 assert build_target_machine_type in arch.machine_ranks, "Build target machine type '{build_target_machine_type}' is not supported on this platform; expected one of {types}".format(
 		build_target_machine_type = build_target_machine_type,
 		types = list(arch.machine_ranks.keys()))
 
-# This is a bit hacky...
-#
-# We invent a new CPU type which is compatible with the host but worse than
-# every existing type, and we use * for the OS type so that we don't beat 'Any'
-# binaries either. This means that we always prefer an existing binary of the
-# desired version to compiling a new one, but we'll compile a new version from source
-# rather than use an older binary.
-arch.machine_groups['newbuild'] = arch.machine_groups.get(build_target_machine_type, 0)
-arch.machine_ranks['newbuild'] = max(arch.machine_ranks.values()) + 1
-host_arch = '*-newbuild'
-
-class ImplRestriction(model.Restriction):
-	reason = "Not the source we're trying to build"
-
-	def __init__(self, impl_id):
-		self.impl_id = impl_id
-
-	def meets_restriction(self, impl):
-		return impl.id == self.impl_id
-
-	def __str__(self):
-		return _("implementation {impl}").format(impl = self.impl_id)
-
-class NewBuildImplementation(model.ZeroInstallImplementation):
-	# Assume that this (potential) binary is available so that we can select it as a
-	# dependency.
-	def is_available(self, stores):
-		return True
-
-def get_commands(src_impl):
-	"""Estimate the commands that the generated binary would have."""
-	cmd = src_impl.commands.get('compile', None)
-	if cmd is None:
-		warn("Source has no compile command! %s", src_impl)
-		return []
-
-	for elem in cmd.qdom.childNodes:
-		if elem.uri == XMLNS_0COMPILE and elem.name == 'implementation':
-			# Assume there's always a run command. Doesn't do any harm to have extra ones,
-			# and there are various ways this might get created.
-			commands = ['run']
-			for e in elem.childNodes:
-				if e.uri == namespaces.XMLNS_IFACE and e.name == 'command':
-					commands.append(e.getAttribute('name'))
-			return commands
-	return []
-
-def add_binary_deps(src_impl, binary_impl):
-	# If src_impl contains a template, add those dependencies to the potential binary.
-	# Note: probably we should add "include-binary" dependencies here too...
-
-	compile_command = src_impl.commands['compile']
-
-	for elem in compile_command.qdom.childNodes:
-		if elem.uri == XMLNS_0COMPILE and elem.name == 'implementation':
-			template = elem
-			break
-	else:
-		return	# No template
-
-	for elem in template.childNodes:
-		if elem.uri == namespaces.XMLNS_IFACE and elem.name in ('requires', 'restricts', 'runner'):
-			dep = model.process_depends(elem, local_feed_dir = None)
-			binary_impl.requires.append(dep)
-
-class AutocompileCache(iface_cache.IfaceCache):
-	def __init__(self):
-		iface_cache.IfaceCache.__init__(self)
-		self.done = set()
-
-	def get_feed(self, url, force = False):
-		feed = iface_cache.IfaceCache.get_feed(self, url, force)
-		if not feed: return None
-
-		if feed not in self.done:
-			self.done.add(feed)
-
-			# For each source impl, add a corresponding binary
-			# (the binary has no dependencies as we can't predict them here,
-			# but they're not the same as the source's dependencies)
-
-			srcs = [x for x in feed.implementations.itervalues() if x.arch and x.arch.endswith('-src')]
-			for x in srcs:
-				new_id = '0compile=' + x.id
-				if not new_id in feed.implementations:
-					new = NewBuildImplementation(feed, new_id, None)
-					feed.implementations[new_id] = new
-					new.set_arch(host_arch)
-					new.version = x.version
-
-					# Give it some dummy commands in case we're using it as a <runner>, etc (otherwise it can't be selected)
-					for cmd_name in get_commands(x):
-						cmd = qdom.Element(namespaces.XMLNS_IFACE, 'command', {'path': 'new-build', 'name': cmd_name})
-						new.commands[cmd_name] = model.Command(cmd, None)
-
-					# Find the <command name='compile'/>
-					add_binary_deps(x, new)
-
-		return feed
-
 class AutoCompiler:
 	# If (due to a bug) we get stuck in a loop, we use this to abort with a sensible error.
-	seen = None		# ((iface, source_id) -> new_binary_id)
+	seen = None		# ((iface, (source_feed, source_id)) -> new_binary_id)
 
-	def __init__(self, config, iface_uri, options):
+	def __init__(self, config, iface_uri, options, gui = False):
 		self.iface_uri = iface_uri
 		self.options = options
 		self.config = config
+		self.solver = solver.Solver(gui, verbose = True)
 
-	def pretty_print_plan(self, solver, root, indent = '- '):
+	def pretty_print_plan(self, sels, root, indent = '- '):
 		"""Display a tree showing the selected implementations."""
 		iface = self.config.iface_cache.get_interface(root)
-		impl = solver.selections[iface]
+		impl = sels.selections[root]
+		arch = impl and impl.attrs.get('arch')
 		if impl is None:
 			msg = 'Failed to select any suitable version (source or binary)'
-		elif impl.id.startswith('0compile='):
+		elif impl.attrs.get('requires-compilation') == 'true':
 			real_impl_id = impl.id.split('=', 1)[1]
 			real_impl = impl.feed.implementations[real_impl_id]
-			msg = 'Compile %s (%s)' % (real_impl.get_version(), real_impl.id)
-		elif impl.arch and impl.arch.endswith('-src'):
-			msg = 'Compile %s (%s)' % (impl.get_version(), impl.id)
+			msg = 'Compile %s (%s)' % (real_impl.version, real_impl.id)
+		elif arch and arch.endswith('-src'):
+			msg = 'Compile %s (%s)' % (impl.version, impl.id)
 		else:
-			if impl.arch:
-				msg = 'Use existing binary %s (%s)' % (impl.get_version(), impl.arch)
+			if arch:
+				msg = 'Use existing binary %s (%s)' % (impl.version, arch)
 			else:
-				msg = 'Use existing architecture-independent package %s' % impl.get_version()
+				msg = 'Use existing architecture-independent package %s' % impl.version
 		self.note("%s%s: %s" % (indent, iface.get_name(), msg))
 
 		if impl:
 			indent = '  ' + indent
-			for x in solver.requires[iface]:
-				self.pretty_print_plan(solver, x.interface, indent)
+			for x in impl.dependencies:
+				self.pretty_print_plan(sels, x.interface, indent)
 
 	def print_details(self, solver):
 		"""Dump debugging details."""
@@ -256,7 +157,8 @@ class AutoCompiler:
 			# Write it out - 0install will add the feed so that older 0install versions can find it
 			writer.save_interface(iface)
 
-			seen_key = (forced_iface_uri, sels.selections[sels.interface].id)
+			impl = sels.selections[sels.interface]
+			seen_key = (forced_iface_uri, (impl.feed, impl.id))
 			assert seen_key not in self.seen, seen_key
 			self.seen[seen_key] = site_package_dir
 		except:
@@ -271,42 +173,41 @@ class AutoCompiler:
 	@tasks.async
 	def recursive_build(self, iface_uri, source_impl_id = None):
 		"""Build an implementation of iface_uri and register it as a feed.
-		@param source_impl_id: the version to build, or None to build any version
-		@type source_impl_id: str
+		@param source_impl_id: the (feed, id) to build, or None to build any version
+		@type source_impl_id: (str, str)
 		"""
-		r = requirements.Requirements(iface_uri)
-		r.source = True
-		r.command = 'compile'
-
-		d = driver.Driver(self.config, r)
 		iface = self.config.iface_cache.get_interface(iface_uri)
-		d.solver.record_details = True
+		r = {
+			"interface": iface.uri,
+			"command": "compile",
+			"source": True,
+			"extra_restrictions": {},
+			"may_compile": True,
+		}
 		if source_impl_id is not None:
-			d.solver.extra_restrictions[iface] = [ImplRestriction(source_impl_id)]
-
-		# For testing...
-		#p.target_arch = arch.Architecture(os_ranks = {'FreeBSD': 0, None: 1}, machine_ranks = {'i386': 0, None: 1, 'newbuild': 2})
+			feed, id = source_impl_id
+			r['extra_restrictions'][iface_uri] = '=%s/%s' % (feed, escaping.underscore_escape(id))
 
 		while True:
 			self.heading(iface_uri)
 			self.note("\nSelecting versions for %s..." % iface.get_name())
-			solved = d.solve_with_downloads()
-			if solved:
-				yield solved
-				tasks.check(solved)
 
-			if not d.solver.ready:
-				self.print_details(d.solver)
-				raise d.solver.get_failure_reason()
+			solved = self.solver.solve(r)
+			#if solved:
+			#	yield solved
+			#	tasks.check(solved)
+
 			self.note("Selection done.")
 
+			sels = selections.Selections(qdom.parse(StringIO.StringIO(solved['info'])))
+
 			self.note("\nPlan:\n")
-			self.pretty_print_plan(d.solver, r.interface_uri)
+			self.pretty_print_plan(sels, iface.uri)
 			self.note('')
 
 			needed = []
-			for dep_iface_uri, dep_sel in d.solver.selections.selections.iteritems():
-				if dep_sel.id.startswith('0compile='):
+			for dep_iface_uri, dep_sel in sels.selections.iteritems():
+				if dep_sel.attrs.get('requires-compilation') == "true":
 					if not needed:
 						self.note("Build dependencies that need to be compiled first:\n")
 					self.note("- {iface} {version}".format(iface = dep_iface_uri, version = dep_sel.version))
@@ -314,7 +215,7 @@ class AutoCompiler:
 
 			if not needed:
 				self.note("No dependencies need compiling... compile %s itself..." % iface.get_name())
-				build = self.compile_and_register(d.solver.selections,
+				build = self.compile_and_register(sels,
 						# force the interface in the recursive case
 						iface_uri if iface_uri != self.iface_uri else None)
 				yield build
@@ -326,23 +227,17 @@ class AutoCompiler:
 
 			self.note("")
 
-			#details = d.solver.details[self.config.iface_cache.get_interface(dep_iface.uri)]
-			#for de in details:
-			#	print de
-
-			dep_source_id = dep_sel.id.split('=', 1)[1]
+			dep_source_id = (dep_sel.feed, dep_sel.id)
 			seen_key = (dep_iface_uri, dep_source_id)
 			if seen_key in self.seen:
 				self.note_error("BUG: Stuck in an auto-compile loop: already built {key}!".format(key = seen_key))
 				# Try to find out why the previous build couldn't be used...
-				dep_iface = self.config.iface_cache.get_interface(dep_iface_uri)
 				previous_build = self.seen[seen_key]
 				previous_build_feed = os.path.join(previous_build, '0install', 'feed.xml')
 				previous_feed = self.config.iface_cache.get_feed(previous_build_feed)
 				previous_binary_impl = previous_feed.implementations.values()[0]
-				raise SafeException("BUG: auto-compile loop: expected to select previously-build binary {binary}:\n\n{reason}".format(
-						binary = previous_binary_impl,
-						reason = d.solver.justify_decision(r, dep_iface, previous_binary_impl)))
+				raise SafeException("BUG: auto-compile loop: expected to select previously-build binary {binary}".format(
+						binary = previous_binary_impl))
 
 			build = self.recursive_build(dep_iface_uri, dep_source_id)
 			yield build
@@ -371,43 +266,9 @@ class AutoCompiler:
 	def note_error(self, msg):
 		print msg
 
-class GUIHandler(handler.Handler):
-	def downloads_changed(self):
-		self.compiler.downloads_changed()
-
-	def confirm_import_feed(self, pending, valid_sigs):
-		return handler.Handler.confirm_import_feed(self, pending, valid_sigs)
-
-	@tasks.async
-	def confirm_install(self, message):
-		from zeroinstall.injector.download import DownloadAborted
-		from zeroinstall.gtkui import gtkutils
-		import gtk
-		box = gtk.MessageDialog(self.compiler.dialog,
-					gtk.DIALOG_DESTROY_WITH_PARENT,
-					gtk.MESSAGE_QUESTION, gtk.BUTTONS_CANCEL,
-					message)
-		box.set_position(gtk.WIN_POS_CENTER)
-
-		install = gtkutils.MixedButton('Install', gtk.STOCK_OK)
-		install.set_flags(gtk.CAN_DEFAULT)
-		box.add_action_widget(install, gtk.RESPONSE_OK)
-		install.show_all()
-		box.set_default_response(gtk.RESPONSE_OK)
-		box.show()
-
-		response = gtkutils.DialogResponse(box)
-		yield response
-		box.destroy()
-
-		if response.response != gtk.RESPONSE_OK:
-			raise DownloadAborted()
-
 class GTKAutoCompiler(AutoCompiler):
 	def __init__(self, config, iface_uri, options):
-		config.handler.compiler = self
-
-		AutoCompiler.__init__(self, config, iface_uri, options)
+		AutoCompiler.__init__(self, config, iface_uri, options, gui = True)
 		self.child = None
 
 		import pygtk; pygtk.require('2.0')
@@ -568,14 +429,7 @@ def do_autocompile(args):
 	if len(args2) != 1:
 		raise __main__.UsageError()
 
-	if options.gui:
-		h = GUIHandler()
-	elif os.isatty(1):
-		h = handler.ConsoleHandler()
-	else:
-		h = handler.Handler()
-	config = load_config(handler = h)
-	config._iface_cache = AutocompileCache()
+	config = load_config()
 
 	iface_uri = model.canonical_iface_uri(args2[0])
 	if options.gui:

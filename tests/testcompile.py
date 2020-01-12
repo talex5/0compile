@@ -48,7 +48,7 @@ def run(*args, **kwargs):
 	got, unused = child.communicate()
 	code = child.wait()
 	if code != kwargs.get('expect_status', 0):
-		raise Exception("Exit status %d:\n%s" % (code, got))
+		raise Exception("Non-zero exit status %d for %s:\n%s" % (code, args, got))
 
 	expected = kwargs.get('expect', '')
 	if expected is not None: # pass None to explicily suppress check
@@ -250,7 +250,7 @@ class TestCompile(unittest.TestCase):
 		compile('report-bug', expect = "file+not+found")
 	
 	def testBuildDeps(self):
-		compile('autocompile', top_build_deps, expect = "build-deps.xml 0.1 requires 3 <= version < 3", expect_status = 1)
+		compile('autocompile', top_build_deps, expect = "build-deps.xml 0.1 requires version 3..!3", expect_status = 1)
 
 	def testPinVersions(self):
 		dest = os.path.join(self.tmpdir, 'pinned_version')
